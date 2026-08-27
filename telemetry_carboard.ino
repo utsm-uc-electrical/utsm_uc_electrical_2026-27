@@ -1,9 +1,8 @@
 #include <TinyGPSPlus.h>
 #include <HardwareSerial.h>
 #include <Adafruit_LSM6DSOX.h>
-
-// #include <SD.h>
-// #include <SPI.h>
+#include <SD.h>
+#include <SPI.h>
 
 TinyGPSPlus gps;
 HardwareSerial SerialGPS(2);   // uart 2
@@ -11,7 +10,12 @@ Adafruit_LSM6DSOX imu;
 
 #define GPS_RX 16   
 #define GPS_TX 17   
-// #define SD X pin number
+
+// Standard ESP32 VSPI pin definitions for SD Card
+#define SD_CS   5
+#define SD_MOSI 23
+#define SD_MISO 19
+#define SD_CLK  18
 
 void setup() {
   Serial.begin(115200);
@@ -28,11 +32,23 @@ void setup() {
   }
   Serial.println("IMU FOUND");
 
-  // if (!SD.begin(SD)) {
-  //   Serial.println("SD Card Mount Failed!");
-  // } else {
-  //   Serial.println("SD Card OK");
-  // }
+  // SD CARD INITIALIZATION ----------------------------------------
+  SD.begin(SD_CS);
+  SPI.begin(SD_CLK, SD_MISO, SD_MOSI, SD_CS);
+  if (!SD.begin(SD_CS)) {
+    Serial.println("SD Card Mount Failed!");
+  } else {
+    Serial.println("SD Card OK");
+    
+    // Changed FILE_WRITE to FILE_APPEND
+    File dataFile = SD.open("/Elec_Test/datalog.csv", FILE_APPEND);
+    if (dataFile && dataFile.size() == 0) {
+      dataFile.println("AccelX,AccelY,AccelZ,GyroX,GyroY,GyroZ");
+    }
+    if (dataFile) {
+      dataFile.close();
+    }
+  }
 }
 
 void loop() {
@@ -66,7 +82,25 @@ void loop() {
   Serial.println(gyro.gyro.z);
 
   Serial.println("----------------------");
-  delay(200);
 
-  // ADD IN THE SD CARD SHIT LATER
+  // SD card CSV formating
+  String dataString = String(accel.acceleration.x) + "," +
+                      String(accel.acceleration.y) + "," +
+                      String(accel.acceleration.z) + "," +
+                      String(gyro.gyro.x) + "," +
+                      String(gyro.gyro.y) + "," +
+                      String(gyro.gyro.z);
+
+  File dataFile = SD.open("/Elec_Test/datalog.csv", FILE_APPEND);
+  if (dataFile) {
+    dataFile.println(dataString);
+    dataFile.close();
+    Serial.println("Data logged to SD.");
+  } else {
+    Serial.println("Error opening datalog.csv for writing.");
+  }
+
+  Serial.println("----------------------");
+
+  delay(200);
 }
