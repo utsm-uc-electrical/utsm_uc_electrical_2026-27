@@ -1,0 +1,13 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "C/C++ Runner: Debug Session",
+      "type": "lldb",
+      "request": "launch",
+      "args": [],
+      "cwd": "/Users/aaditgupta/Downloads/utsm_uc_electrical_2026-27",
+      "program": "/Users/aaditgupta/Downloads/utsm_uc_electrical_2026-27/build/Debug/outDebug"
+    }
+  ]
+}
