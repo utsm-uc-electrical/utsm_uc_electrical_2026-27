@@ -16,6 +16,11 @@
 #include <stdarg.h>
 #include <math.h>
 
+// TMP116 real-hardware integration built on UTSM RPM/current CAN telemetry.
+// TMP116 communicates via I2C. Reading it *over CAN* requires a separate MCU
+// to read register 0x00 and forward the raw 16-bit word in an agreed CAN frame.
+// No simulated readings or self-test CAN transmitters are included here.
+
 #if defined(__has_include)
 #if __has_include("webapp.h")
 #include "webapp.h"
@@ -68,6 +73,28 @@ static const int PIN_CAN_RX  = 33;
 #define CAN_FRESH_MS    500     // Omit RPM if no 0x203 frame arrived in the last 500 ms
 #define CAN_CURRENT_FRESH_MS 500  // Omit 0x204 values when older than 500 ms
 #define CAN_LISTEN_ONLY 0       // 0 = Normal mode (ACKs STM32 frames), 1 = Passive listen-only
+
+// ------------------- TMP116 hardware configuration -------------------
+// The STM32 code you shared DOES NOT transmit temperature. 0x205 is a
+// PROPOSED, UNCONFIRMED CAN protocol, not a validated vehicle specification.
+// Leave 0 until the STM32 team agrees on CAN ID 0x205, standard data frame,
+// exactly 2 bytes containing TMP116 register 0x00 in MSB-first order.
+#define TMP116_CAN_RX_ENABLED      0
+#define TMP116_CAN_ID              0x205
+#define TMP116_FRESH_MS            2500   // Tune to actual STM32 send interval
+
+// If TMP116 is WIRED TO THIS ESP32 instead (not to the STM32), enable this
+// alternative. Reading directly over I2C does NOT count as receiving CAN.
+// Never enable both sources at once.
+#define TMP116_DIRECT_I2C_ENABLED  0
+#define TMP116_I2C_POLL_MS         500
+#define TMP116_REG_TEMPERATURE     0x00
+#define TMP116_REG_DEVICE_ID       0x0F
+#define TMP116_EXPECTED_DEVICE_ID  0x1116
+#define TMP116_C_PER_COUNT         0.0078125f // 1/128 C/count (TI datasheet)
+#if TMP116_CAN_RX_ENABLED && TMP116_DIRECT_I2C_ENABLED
+#error "Choose only one TMP116 source: CAN or direct I2C"
+#endif
 
 #define I2C_HZ          100000
 #define I2C_TIMEOUT_MS  20
@@ -210,6 +237,14 @@ static bool     canCurrentSeen    = false;
 static uint32_t canCurrentLastMs  = 0;
 static uint32_t canCurrentFrames  = 0;
 
+// TMP116 measurement, shared by the optional CAN and local-I2C hardware paths.
+// We keep only the last valid reading and its time, so no growing RAM usage.
+static float    tmp116TempC = 0.0f;
+static bool     tmp116Seen = false;
+static uint32_t tmp116LastMs = 0;
+static uint32_t tmp116CanFrames = 0;
+static uint8_t  tmp116I2cAddress = 0;  // 0 means not discovered
+
 bool canBegin() {
 #if HAVE_CAN
   twai_mode_t mode = CAN_LISTEN_ONLY ? TWAI_MODE_LISTEN_ONLY : TWAI_MODE_NORMAL;
@@ -237,6 +272,21 @@ bool canBegin() {
 static int32_t decodeSigned16BE(uint8_t highByte, uint8_t lowByte) {
   uint16_t bits = ((uint16_t)highByte << 8) | (uint16_t)lowByte;
   return (bits & 0x8000U) ? ((int32_t)bits - 65536) : (int32_t)bits;
+}
+
+// TI TMP116 temperature register: signed 16-bit two's complement, MSB first.
+// Example 0x0C80 = 3200/128 = 25.0 C. 0x8000 means not ready after reset.
+static bool decodeTmp116Raw(uint8_t msb, uint8_t lsb, float *outC) {
+  if (outC == nullptr) return false;
+  uint16_t raw = ((uint16_t)msb << 8) | (uint16_t)lsb;
+  if (raw == 0x8000U) return false; // TMP116 power-on placeholder, -256 C
+  *outC = (float)decodeSigned16BE(msb, lsb) * TMP116_C_PER_COUNT;
+  return true;
+}
+
+static inline bool tmp116HaveTemp() {
+  return tmp116Seen &&
+         (uint32_t)(millis() - tmp116LastMs) <= TMP116_FRESH_MS;
 }
 
 void canPoll() {
@@ -273,6 +323,23 @@ void canPoll() {
       canCurrentSeen = true;
       canCurrentLastMs = millis();
       canCurrentFrames++;
+
+#if TMP116_CAN_RX_ENABLED
+    } else if (msg.identifier == TMP116_CAN_ID && msg.data_length_code == 2) {
+      // PROVISIONAL 0x205 transport contract, requires a matching STM32 sender:
+      //   data[0] = TMP116 register 0x00 high byte
+      //   data[1] = TMP116 register 0x00 low byte
+      // The TMP116 itself does not speak CAN; another MCU must relay it.
+      float c;
+      if (decodeTmp116Raw(msg.data[0], msg.data[1], &c)) {
+        tmp116TempC = c;
+        tmp116Seen = true;
+        tmp116LastMs = millis();
+        tmp116CanFrames++;
+      } else {
+        canOtherIds++; // Invalid TMP116 startup sentinel or decoding failure
+      }
+#endif
 
     } else {
       // Unknown CAN ID or incorrect payload length; do not decode it.
@@ -322,6 +389,19 @@ void canDump() {
                   (unsigned long)(millis() - canCurrentLastMs));
   } else {
     Serial.println(F("     current = (no 0x204 frames received yet)"));
+  }
+
+  Serial.printf("TMP116: CAN ID 0x%03X receiver %s (UNCONFIRMED protocol) | frames=%lu\n",
+                TMP116_CAN_ID, TMP116_CAN_RX_ENABLED ? "ENABLED" : "DISABLED",
+                (unsigned long)tmp116CanFrames);
+  if (tmp116HaveTemp()) {
+    Serial.printf("     TMP116 = %.4f C (%lu ms old, source=%s)\n",
+                  tmp116TempC, (unsigned long)(millis() - tmp116LastMs),
+                  TMP116_DIRECT_I2C_ENABLED ? "I2C" : "CAN");
+  } else if (tmp116Seen) {
+    Serial.println(F("     TMP116 = stale (not included in telemetry)"));
+  } else {
+    Serial.println(F("     TMP116 = unavailable (no real temperature received)"));
   }
 }
 /* Testing CANBUS with test input 1500 RPM (only in selftest mode)
@@ -396,6 +476,62 @@ bool i2cRead16(uint8_t addr, uint8_t reg, uint16_t *out) {
   return ok;
 }
 
+// OPTIONAL real TMP116 I2C path. This only works when TMP116 is physically
+// connected to the ESP32's SDA=GPIO21, SCL=GPIO22 and powered correctly.
+// Detect the TMP116 by the TI device-ID register at 0x0F (= 0x1116).
+static bool tmp116DiscoverI2c() {
+  for (uint8_t address = 0x48; address <= 0x4B; ++address) {
+    uint16_t id = 0;
+    if (i2cRead16(address, TMP116_REG_DEVICE_ID, &id) &&
+        id == TMP116_EXPECTED_DEVICE_ID) {
+      tmp116I2cAddress = address;
+      return true;
+    }
+  }
+  tmp116I2cAddress = 0;
+  return false;
+}
+
+static bool tmp116ReadI2cOnce(float *outC, uint16_t *outRaw) {
+  if (!tmp116I2cAddress && !tmp116DiscoverI2c()) return false;
+  uint16_t raw;
+  if (!i2cRead16(tmp116I2cAddress, TMP116_REG_TEMPERATURE, &raw)) {
+    tmp116I2cAddress = 0; // Re-probe on next attempt
+    return false;
+  }
+  if (outRaw) *outRaw = raw;
+  return decodeTmp116Raw((uint8_t)(raw >> 8), (uint8_t)(raw & 0xFF), outC);
+}
+
+// Local I2C telemetry path, only if specifically enabled in configuration.
+static void tmp116PollI2c() {
+#if TMP116_DIRECT_I2C_ENABLED
+  static uint32_t lastPoll = 0;
+  uint32_t now = millis();
+  if ((uint32_t)(now - lastPoll) < TMP116_I2C_POLL_MS) return;
+  lastPoll = now;
+  float temp;
+  if (tmp116ReadI2cOnce(&temp, nullptr)) {
+    tmp116TempC = temp;
+    tmp116Seen = true;
+    tmp116LastMs = now;
+  }
+#endif
+}
+
+// Manual diagnostic command 'm'. Prints a real I2C reading only; will NOT
+// pretend that an I2C read was received from CAN or update CAN counters.
+static void tmp116I2cDump() {
+  float temp = 0;
+  uint16_t raw = 0;
+  if (tmp116ReadI2cOnce(&temp, &raw)) {
+    Serial.printf("TMP116 I2C: addr 0x%02X, raw 0x%04X, %.4f C (REAL local I2C)\n",
+                  tmp116I2cAddress, raw, temp);
+  } else {
+    Serial.println(F("TMP116 I2C: no valid reading (sensor absent, bus error, or conversion not ready)"));
+  }
+}
+
 bool i2cWrite16(uint8_t addr, uint8_t reg, uint16_t val) {
   if (!i2cLock()) return false;
   Wire.beginTransmission(addr);
@@ -458,6 +594,7 @@ void i2cScan() {
     if (hit) {
       Serial.printf("  0x%02X", a);
       if (a == 0x6A || a == 0x6B)      Serial.print(F("   LSM6DSOX (IMU)"));
+      else if (a >= 0x48 && a <= 0x4B) Serial.print(F("   possible TMP116 address (use 'm' to check ID)"));
       else if (a >= 0x40 && a <= 0x4F) Serial.print(F("   INA226 address range"));
       Serial.println();
       found++;
@@ -825,7 +962,10 @@ String helloJson() {
   s += ",\"clients\":" + String(sseCount());
   s += sdOk  ? ",\"sd\":\"logging\"" : ",\"sd\":null";
   s += jmOk  ? ",\"jm\":\"ina226\""  : ",\"jm\":null";
-  s += canOk ? ",\"can\":\"0x203\""  : ",\"can\":null";
+  s += canOk ? ",\"can\":\"0x203_0x204\"" : ",\"can\":null";
+  s += TMP116_CAN_RX_ENABLED ? ",\"tmp116_mode\":\"can_provisional\"" :
+       (TMP116_DIRECT_I2C_ENABLED ? ",\"tmp116_mode\":\"i2c\"" :
+                                    ",\"tmp116_mode\":null");
   s += ",\"jmMiss\":" + String((unsigned long)jmMisses);
   s += ",\"cfg\":{";
   auto f = [](float v) { return isNan(v) ? String("null") : String(v, 2); };
@@ -998,6 +1138,13 @@ void buildPacket(char *buf, size_t sz) {
   }
 #endif
 
+  // Real TMP116 reading only; never fabricated. Omit if missing or stale.
+  if (tmp116HaveTemp()) {
+    appendf(buf, sz, &n, ",\"tmp116_temp_c\":%.4f", tmp116TempC);
+    appendf(buf, sz, &n, ",\"tmp116_source\":\"%s\"",
+            TMP116_DIRECT_I2C_ENABLED ? "i2c" : "can");
+  }
+
   appendf(buf, sz, &n, ",\"run\":%d", runArmed ? 1 : 0);
   if (runArmed) appendf(buf, sz, &n, ",\"armT\":%lu", (unsigned long)runArmT);
   int r = staRssi();
@@ -1008,7 +1155,7 @@ void buildPacket(char *buf, size_t sz) {
 void logRow() {
 #if SD_LOGGING
   if (!sdOk || !logFile) return;
-  char row[320];
+  char row[352];
   size_t n = 0;
   const int64_t nowUs = esp_timer_get_time();
   appendf(row, sizeof row, &n, "%lu,", (unsigned long)(uint32_t)(nowUs / 1000));
@@ -1050,6 +1197,10 @@ void logRow() {
             (unsigned)canDutyPct, (unsigned)canStopReason);
   else
     appendf(row, sizeof row, &n, ",,,,");
+
+  // TMP116 temperature column: empty unless genuine fresh sensor/CAN data.
+  if (tmp116HaveTemp()) appendf(row, sizeof row, &n, "%.4f,", tmp116TempC);
+  else                  appendf(row, sizeof row, &n, ",");
 
   int64_t utcMs;
   if (utcMsAt(nowUs, &utcMs)) appendf(row, sizeof row, &n, "%lld,", (long long)utcMs);
@@ -1118,14 +1269,14 @@ void openLog() {
                  " · jm=%s · jm_current=%d · can=%s",
                  SAMPLE_HZ, IMU_HZ, ipath + 11, accOff[0], accOff[1], accOff[2],
                  UTC_SECOND_OFFSET, jmOk ? "ina226" : "none", JM_HAVE_CURRENT,
-                 canOk ? "0x203_500k" : "none");
+                 canOk ? "0x203_0x204_500k" : "none");
 #if JM_HAVE_CURRENT
   logFile.printf(" · r_shunt_ohm=%.5f", JM_R_SHUNT);
 #endif
   logFile.printf(" · plan=%s\n", PLAN_ID_STR);
   logFile.println(F("Millis,AccelX_mps2,AccelY_mps2,AccelZ_mps2,GyroX_dps,GyroY_dps,GyroZ_dps,"
                     "Latitude,Longitude,Altitude_m,Speed_kmh,Satellites,Volts_V,Amps_A,Motor_RPM,"
-                     "MotorCurrent_A,InputCurrentEstimate_A,Duty_pct,StopReason,UtcMs,BootId"));
+                      "MotorCurrent_A,InputCurrentEstimate_A,Duty_pct,StopReason,TMP116_Temp_C,UtcMs,BootId"));
   logFile.flush();
   Serial.printf("SD: logging to %s\n", path);
 
@@ -1221,6 +1372,16 @@ void setup() {
 
   if (imuOk && !imuSelfCheck()) imuOk = false;
 
+  // Let the operator know which *real* TMP116 input, if any, is configured.
+  Serial.printf("TMP116: CAN temperature RX %s, proposed ID=0x%03X (needs STM32 agreement)\n",
+                TMP116_CAN_RX_ENABLED ? "ENABLED" : "DISABLED", TMP116_CAN_ID);
+#if TMP116_DIRECT_I2C_ENABLED
+  Serial.println(F("TMP116: direct ESP32 I2C polling ENABLED (GPIO21/22)"));
+  if (!tmp116DiscoverI2c()) Serial.println(F("TMP116: no local I2C sensor found yet"));
+#else
+  Serial.println(F("TMP116: direct ESP32 I2C telemetry DISABLED (manual 'm' probe available)"));
+#endif
+
 #if HAVE_JOULEMETER
   jmOk = jmBegin();
   if (jmOk) {
@@ -1284,7 +1445,7 @@ void setup() {
   Serial.println(F("PLAN: none - no plan.h was in the sketch folder at build time, so the dashboard "
                    "uses the speed band / joulemeter cue. Add plan.h from the planner and rebuild."));
 #endif
-  Serial.println(F("Serial: 'c' flip test · 's' I2C scan · 'j' joulemeter · 'k' CAN status · 'u' UTC/PPS/IMU check."));
+  Serial.println(F("Serial: 'c' flip test · 's' I2C scan · 'j' joulemeter · 'k' CAN status · 'm' TMP116 local I2C probe · 'u' time/IMU."));
 
   if (imuOk) {
     xTaskCreatePinnedToCore(imuTask, "imu", 6144, NULL, 2, NULL, 1);
@@ -1302,6 +1463,7 @@ void loop() {
   utcPoll();
   imuDrain();
   canPoll();
+  tmp116PollI2c(); // No-op unless direct I2C hardware source is enabled
   // canHeartbeat();  // Its function definition is commented out; no test TX in normal operation.
 
   if (Serial.available()) {
@@ -1310,6 +1472,7 @@ void loop() {
     else if (ch == 's') { Serial.read(); i2cScan(); }
     else if (ch == 'j') { Serial.read(); jmDump(); }
     else if (ch == 'k') { Serial.read(); canDump(); }
+    else if (ch == 'm') { Serial.read(); tmp116I2cDump(); }
     // The original 'p' command called canPinScan(), which is not defined in this sketch.
     else if (ch == 'u') { Serial.read(); utcDump(); }
     else                  Serial.read();
