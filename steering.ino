@@ -6,8 +6,6 @@
 #define TX_GPIO_NUM   32
 #define RX_GPIO_NUM   33
 #define CAN_ID        0x10
-#define PT_CAN_ID     0x3F
-#define H2_CAN_ID     0x06
 
 #define HAZARDS_CAN_MASK      0x00
 #define BR_CAN_MASK           0x01
@@ -31,9 +29,6 @@ const uint32_t CAN_masks[NUM_BUTTONS] = {HAZARDS_CAN_MASK, BR_CAN_MASK, BL_CAN_M
 Bounce * buttons_debounced = new Bounce[NUM_BUTTONS];
 
 uint8_t devices_enable = 0x00;
-uint8_t PT_data_buf = 0x00;
-uint8_t H2_data_buf[6];
-uint32_t RPM = 0x00;
 bool button_changed = false;
 bool hazards_on = false;
 uint32_t gpioStates = 0x0;
@@ -126,67 +121,16 @@ void loop() {
     CAN.endPacket();
 
     Serial.println("done");
+
+    // print each device's state in plain words
+    Serial.printf("  Hazards: %s | R blinker: %s | L blinker: %s | Headlights: %s | Wiper: %s | Horn: %s\n",
+                  hazards_on                               ? "ON" : "off",
+                  (devices_enable & BR_CAN_MASK)           ? "ON" : "off",
+                  (devices_enable & BL_CAN_MASK)           ? "ON" : "off",
+                  (devices_enable & HEADLIGHTS_CAN_MASK)   ? "ON" : "off",
+                  (devices_enable & WIPER_CAN_MASK)        ? "ON" : "off",
+                  (devices_enable & HORN_CAN_MASK)         ? "ON" : "off");
+
     button_changed = false;
-  }
-
-    // try to parse CAN packet
-  int packetSize = CAN.parsePacket();
-  if (packetSize) {
-    RPM = 0;
-    int bytes_read = 0;
-    // received a packet
-    Serial.print ("Received ");
-
-    if (CAN.packetExtended()) {
-      Serial.print ("extended ");
-    }
-
-    if (CAN.packetRtr()) {
-      // Remote transmission request, packet contains no data
-      Serial.print ("RTR ");
-    }
-    uint8_t received_ID = CAN.packetId();
-    Serial.print ("packet with id 0x");
-    Serial.print (received_ID, HEX);
-
-    if (CAN.packetRtr()) {
-      Serial.print (" and requested length ");
-      Serial.println (CAN.packetDlc());
-    } else {
-      Serial.print (" and length ");
-      Serial.println (packetSize);
-    
-      // only print packet data for non-RTR packets
-      while (CAN.available()) {
-        if(received_ID == PT_CAN_ID){
-          // current_device_states = (uint8_t) CAN.read();
-          // Serial.printf("0x%02X", current_device_states);
-          PT_data_buf = (uint8_t) CAN.read();
-          bytes_read++;
-          Serial.printf("0x%02X  ", PT_data_buf);
-          if(bytes_read <= 4){
-            RPM += (PT_data_buf << (8 * (4-bytes_read)));
-            Serial.printf("0x%08X\n", RPM);
-            Serial.printf("%d", bytes_read);
-          }
-        } else if (received_ID == H2_CAN_ID) {
-            uint8_t b = (uint8_t) CAN.read();
-            if (bytes_read < 6) H2_data_buf[bytes_read] = b;
-            bytes_read++;
-        } else {
-            CAN.read();
-        }
-      Serial.println();
-      }
-
-      // decoded readouts for SERIAL (replaces the old TFT output)
-      if (received_ID == PT_CAN_ID) {
-        Serial.printf("Speed (raw RPM): %lu\n", (unsigned long) RPM);
-      } else if (received_ID == H2_CAN_ID && bytes_read >= 4) {
-        Serial.printf("H2: %.2f ppm\n", ((H2_data_buf[0] * 256) + H2_data_buf[1]) * 10.0);
-        Serial.printf("Temp: %.2f C\n", ((H2_data_buf[2] << 8) | H2_data_buf[3]) / 100.0);
-      }
-    }
-    Serial.println();
   }
 }
