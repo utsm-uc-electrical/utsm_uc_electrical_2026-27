@@ -1,0 +1,25 @@
+STM32L476 CAN folder relocation verification — 2026-11-13
+Module location: Core/Src/CAN/can_app.c and Core/Src/CAN/can_app.h
+Module contents unchanged by the move. main.c includes "CAN/can_app.h".
+Default configuration remains CAN_APP_NODE_COUNT=2.
+
+Native tests: PASS for both 2-node and 4-node configurations.
+Debug: full clean ARM compile/link PASS; 0 warnings/errors.
+Release: full clean ARM compile/link PASS; 0 warnings/errors.
+Relocated module object linked; RX/error callbacks are strong definitions;
+all 12 originally requested debugger symbols retained.
+
+Builds ran in disposable /tmp project copies using GNU Tools for STM32 14.3.rel1.
+Generated source/object entries and output directory for Core/Src/CAN were
+  added only in those copies to model CubeIDE managed source discovery.
+Original .cproject includes Core recursively as a managed source directory.
+Original Debug/Release outputs were not overwritten. Refresh (F5), Clean,
+  and Build in CubeIDE before flashing; confirm CAN/can_app.c is compiled.
+Physical communication was not tested during this file move.
+
+Verified build directory: /tmp/pb5-can-folder-build-6mss5g7q
+main.c SHA-256: ad9cd540e8dee1f522e55c433b9911d06d969274a0c9ee2dcd11945a94019aa6
+CAN/can_app.c SHA-256: 8844964c0e9ef6f1d3cee4c16863ff66dae284746f5c9404b270e19c31cf2079
+CAN/can_app.h SHA-256: db6ccf2a46c54dc889ef9a3d639d560ff80bde99b5cc5498d4ced34a1f084bd5
+Debug ELF SHA-256: 499ddaf2e813268d9118aa05027b5a03c5a0a4bb7da0fbd1e66c5ef490318149
+Release ELF SHA-256: 66eb2e62a4a831874bb559ff26754b38fa5dd5f148295404507a68af0be4b9ed
